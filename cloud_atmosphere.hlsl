@@ -1,5 +1,5 @@
 struct CloudFunctions {
-    #define MAX_ITER 600
+    #define MAX_ITER 200
     //Shared/Derived parameters
     float2 SCREEN_UV;
     float3 CAMERA_POSITION;
@@ -178,23 +178,28 @@ struct CloudFunctions {
     }
 
     //Samples the cloud volume noise density formula at a given point
-    float SampleCloudDensity(float3 position){
+    float SampleCloudDensity(float3 position) {
         float mod_noise_scale = CLOUD_MAX_RADIUS * CLOUD_NOISE_SCALE;
+        
+        // Remove micro detail sampling entirely
         float3 dst_scale = CLOUD_DISTORTION_SCALE_WEIGHT.xyz * mod_noise_scale;
         float3 shp_scale = CLOUD_SHAPE_SCALE_WEIGHT.xyz * mod_noise_scale;
         float3 dtl_scale = CLOUD_DETAIL_SCALE_WEIGHT.xyz * mod_noise_scale;
-        float3 mcr_scale = CLOUD_MICRO_SCALE_WEIGHT.xyz * mod_noise_scale;
-        float4 speed_coef = float4(.5, 1, 1.1, -.5);
-        float4 distortion_samp = (Texture3DSample(CLOUD_VOLUME_TEXTURE, CLOUD_VOLUME_TEXTURE_SAMPLER, position/dst_scale + CLOUD_NOISE_OFFSET * speed_coef.x) - 0.5) * CLOUD_DISTORTION_SCALE_WEIGHT.a;
-        float4 shape_samp = Texture3DSample(CLOUD_VOLUME_TEXTURE, CLOUD_VOLUME_TEXTURE_SAMPLER, position/shp_scale + CLOUD_NOISE_OFFSET  * speed_coef.y + distortion_samp.xyz) * CLOUD_SHAPE_SCALE_WEIGHT.a;
-        float4 detail_samp = Texture3DSample(CLOUD_VOLUME_TEXTURE, CLOUD_VOLUME_TEXTURE_SAMPLER, position/dtl_scale + CLOUD_NOISE_OFFSET * speed_coef.z) * CLOUD_DETAIL_SCALE_WEIGHT.a;
-        float4 micro_samp = Texture3DSample(CLOUD_VOLUME_TEXTURE, CLOUD_VOLUME_TEXTURE_SAMPLER, (position/mcr_scale + CLOUD_NOISE_OFFSET * speed_coef.a) * CLOUD_MICRO_SCALE_WEIGHT.a);  
-        float4 final_samp = (shape_samp + detail_samp + micro_samp) / (CLOUD_SHAPE_SCALE_WEIGHT.a + CLOUD_DETAIL_SCALE_WEIGHT.a + CLOUD_MICRO_SCALE_WEIGHT.a);
-
-        float d = (final_samp.x * 3.0 + final_samp.y * 2.0 + final_samp.z * 1.0) / 6.0 * HeightCoefficient(position);
-        d -= CLOUD_DENSITY_FLOOR;
-        d = max(d, 0.0);
-        return pow(d, CLOUD_DENSITY_FALLOFF);
+        
+        float2 speed_coef = float2(.5, 1);  // Simplified speed coefficients
+        
+        // Simplified sampling with fewer texture reads
+        float4 shape_samp = Texture3DSample(CLOUD_VOLUME_TEXTURE, CLOUD_VOLUME_TEXTURE_SAMPLER, 
+            position/shp_scale + CLOUD_NOISE_OFFSET * speed_coef.x) * CLOUD_SHAPE_SCALE_WEIGHT.a;
+        float4 detail_samp = Texture3DSample(CLOUD_VOLUME_TEXTURE, CLOUD_VOLUME_TEXTURE_SAMPLER, 
+            position/dtl_scale + CLOUD_NOISE_OFFSET * speed_coef.y) * CLOUD_DETAIL_SCALE_WEIGHT.a;
+        
+        float4 final_samp = (shape_samp + detail_samp) / (CLOUD_SHAPE_SCALE_WEIGHT.a + CLOUD_DETAIL_SCALE_WEIGHT.a);
+        
+        // Simplified density calculation
+        float density = final_samp.x * HeightCoefficient(position);
+        density = max(density - CLOUD_DENSITY_FLOOR, 0.0);
+        return pow(density, CLOUD_DENSITY_FALLOFF);
     }
 
     //Ray march function to do our cloud light marching
@@ -214,34 +219,47 @@ struct CloudFunctions {
     }
 
     //Trace function to trace a single cloud ray
-    float4 CloudMarch(float3 startPosition, float stepSize, float distanceLimit, float4 cloudAccumulation){
+    float4 CloudMarch(float3 startPosition, float stepSize, float distanceLimit, float4 cloudAccumulation) {
+        // Early exit if transmittance is already very low
+        if(cloudAccumulation.a < 0.01) return cloudAccumulation;
+        
         float distanceTravelled = 0;
         int iter = 0;
         
-        while(distanceTravelled < distanceLimit){
+        while(distanceTravelled < distanceLimit) {
             float3 samplePosition = startPosition + CAMERA_VECTOR * distanceTravelled;
             float density = SampleCloudDensity(samplePosition);
-            if(density > 0){
+            
+            // Skip low density samples
+            if(density > 0.01) {  // Add density threshold
                 float lightTransmittance = LightMarch(samplePosition, stepSize);
                 float shadowFactor = ShadowFactor(samplePosition);
-                //Each step with density accumulates: cloud density * step size * transmittance * light transmittance * phase * shadow factor
-                cloudAccumulation.xyz += density * stepSize * cloudAccumulation.a * lightTransmittance * HenyeyGreenstein(LIGHT_DIRECTION, CAMERA_VECTOR, CLOUD_G * shadowFactor) * max(shadowFactor, CLOUD_AMBIENT) ;
-                //And adjusts transmittance
+                
+                cloudAccumulation.xyz += density * stepSize * cloudAccumulation.a * 
+                    lightTransmittance * HenyeyGreenstein(LIGHT_DIRECTION, CAMERA_VECTOR, 
+                    CLOUD_G * shadowFactor) * max(shadowFactor, CLOUD_AMBIENT);
+                    
                 cloudAccumulation.a *= exp(-density * stepSize * CLOUD_ABSORPTION_TO_CLOUD);
-                if(cloudAccumulation.a < .01) break;
+                if(cloudAccumulation.a < 0.01) break;
             }
+            
             distanceTravelled += stepSize;
             iter++;
-            if(iter > MAX_ITER) break; //Hard cap on iterations
+            if(iter > MAX_ITER) break;
         }
         return cloudAccumulation;
     }
 
-    //Traces any needed cloud rays for a given GetCloudTraceSegments output
-    float4 AccumulateClouds(){
+    float GetLODMultiplier() {
+        float distToCamera = length(CAMERA_POSITION - PLANET_POSITION);
+        float baseDistance = PLANET_RADIUS * 2.0;
+        return saturate(distToCamera / baseDistance) * 0.5 + 0.5;  // 1.0 at base distance, 1.5 at far distances
+    }
+
+    float4 AccumulateClouds() {
+        float lodMultiplier = GetLODMultiplier();
+        float stepSize = ((CLOUD_MAX_RADIUS - CLOUD_MIN_RADIUS) * CLOUD_STEP_SCALE * lodMultiplier) / float(CLOUD_DENSITY_STEPS);
         float4 segments = GetCloudTraceSegments();
-        //step size + blue noise to hide slices
-        float stepSize = ((CLOUD_MAX_RADIUS - CLOUD_MIN_RADIUS) * CLOUD_STEP_SCALE) / float(CLOUD_DENSITY_STEPS);
         float blueSamp = Texture2DSample(CLOUD_BLUE_NOISE_TEXTURE, CLOUD_BLUE_NOISE_TEXTURE_SAMPLER, SCREEN_UV * 10);
         float blueFactor = 1.0;
         float blueOffset = (blueSamp - .5) * blueFactor * stepSize;
@@ -404,6 +422,17 @@ struct CloudFunctions {
 
     //Composite our scene color and atmosphere and cloud outputs
     float3 MainImage() {
+        // Add near start to visualize different aspects:
+        #ifdef DEBUG_CLOUDS
+            float3 debugPos = CAMERA_POSITION + CAMERA_VECTOR * 1000; // Sample point
+            float4 segments = GetCloudTraceSegments();
+            return float4(
+                SampleCloudDensity(debugPos),  // R: density
+                HeightCoefficient(debugPos),    // G: height coefficient
+                segments.x / 10000.0,           // B: ray start distance
+                1.0
+            );
+        #endif
         float3 skylight_color = Skylight();        
         atmoOut atmosphereScattering = CalculateScattering(CAMERA_POSITION, CAMERA_VECTOR, SCENE_DEPTH, skylight_color, ATMO_DENSITY_STEPS, ATMO_LIGHT_STEPS);
         float4 cloudAccumulation = AccumulateClouds();
